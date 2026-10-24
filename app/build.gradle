@@ -1,0 +1,37 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'dev.local.galleryexclude'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'dev.local.galleryexclude'
+        minSdk 30
+        targetSdk 35
+        versionCode 12
+        versionName '0.4.1'
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+}
+
+dependencies {
+    compileOnly files('libs/api-82.jar')
+}

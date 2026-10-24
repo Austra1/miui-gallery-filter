@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">相册目录排除</string>
+    <string name="xposed_description">排除指定目录及子目录的相册显示。支持系统目录选择，保存后自动重启相册。</string>
+    <string name="screen_intro">让指定目录从相册中隐去，原文件留在原处。</string>
+    <string name="choose_directory">添加目录</string>
+    <string name="manual_toggle">手动输入路径</string>
+    <string name="directory_picker_unavailable">未找到系统目录选择器，请使用备用的手动输入。</string>
+    <string name="directory_provider_unsupported">无法取得此来源的本地目录路径。请从内部存储或 SD 卡选择目录，或使用手动输入。</string>
+    <string name="auto_restart_help">保存后自动重启小米相册</string>
+    <string name="restart_running">规则已保存，正在重启相册…</string>
+    <string name="restart_succeeded">已保存，相册已重新打开</string>
+    <string name="restart_failed">规则已保存，但相册未能重启。请再次保存，或手动结束并重开相册。</string>
+    <string name="restart_channel_unavailable">规则已保存。请先手动结束并重开一次相册，再保存重试。</string>
+    <string name="path_label">目录绝对路径</string>
+    <string name="path_hint" translatable="false">/storage/emulated/0/Download</string>
+    <string name="path_help">按原样保留空格与大小写；目录可以尚未创建。</string>
+    <string name="add_rule">添加到列表</string>
+    <string name="rules_heading">排除的目录</string>
+    <string name="rules_count">排除的目录 · %1$d</string>
+    <string name="empty_list">还没有排除目录\n添加后，该目录中的图片和视频将不在相册中显示。</string>
+    <string name="list_unavailable">暂时无法读取目录列表</string>
+    <string name="delete_rule">删除</string>
+    <string name="delete_description">删除目录 %1$s</string>
+    <string name="shadowed_rule">已被 %1$s 递归覆盖；删除父规则后仍会保留。</string>
+    <string name="root_note">覆盖全部本地原路径</string>
+    <string name="root_title">添加根目录规则？</string>
+    <string name="root_body">“/”会匹配全部已解析的绝对本地原路径。请确认这是你要排除的范围。</string>
+    <string name="confirm_add">确认添加</string>
+    <string name="duplicate_rule">此目录已在列表中</string>
+    <string name="empty_path">请输入目录绝对路径</string>
+    <string name="not_absolute">必须以 / 开头，不能使用 URI 或相对路径</string>
+    <string name="dot_segment">请输入不含 . 或 .. 路径段的直接绝对路径</string>
+    <string name="nul_character">路径不能包含 NUL 字符</string>
+    <string name="pending_input">请先将输入添加到列表，或清空输入后保存</string>
+    <string name="save_rules">保存规则</string>
+    <string name="dirty_status">有未保存的修改</string>
+    <string name="empty_saved">尚未设置排除目录</string>
+    <string name="rules_saved">规则已保存</string>
+    <string name="shared_unavailable">配置共享不可用，未保存。请确认 LSPosed 已启用本模块，然后完全结束并重新打开模块。</string>
+    <string name="config_invalid">无法读取规则，原配置未被覆盖。请重新读取后再试。</string>
+    <string name="save_failed">保存失败，请重试。草稿已保留。</string>
+    <string name="save_recovery_required">保存未完成，草稿已保留。请退出并重新打开应用，再确认已保存的规则。</string>
+    <string name="retry_config">重新读取配置</string>
+    <string name="gallery_unsupported">当前相册版本 %1$s 暂不支持，请使用小米相册 3.5.7.10。</string>
+    <string name="gallery_not_found">未找到小米相册。请安装支持的 3.5.7.10 版本。</string>
+    <string name="discard_title">放弃未保存的修改？</string>
+    <string name="discard_body">已保存的目录规则不受影响。</string>
+    <string name="discard">放弃修改</string>
+    <string name="keep_editing">继续编辑</string>
+    <string-array name="xposed_scope">
+        <item>com.miui.gallery</item>
+    </string-array>
+    <string name="root_name">所有本地目录</string>
+    <string name="manual_collapse">收起手动输入</string>
+    <string name="recursive_help">自动包含所选目录的所有子目录</string>
+</resources>
