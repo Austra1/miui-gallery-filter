@@ -8,6 +8,8 @@ import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import dev.local.galleryexclude.rules.PathRules;
+import dev.local.galleryexclude.compat.CompatibilityState;
+import dev.local.galleryexclude.compat.CompatibilityReport.Feature;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -23,6 +25,7 @@ import java.util.function.Consumer;
 final class SearchIconGuard {
     private final PathRules rules;
     private final Consumer<String> log;
+    private final CompatibilityState compatibility;
     private final Class<?> ownerType, shareType, listenerType, glide;
     private final Method consume, awaitFullLoad;
     private final Map<Long, Object> originals = new ConcurrentHashMap<>();
@@ -32,8 +35,8 @@ final class SearchIconGuard {
     private Object observer;
     private XC_MethodHook.Unhook hook;
 
-    SearchIconGuard(ClassLoader loader, PathRules rules, Consumer<String> log) throws ReflectiveOperationException {
-        this.rules=rules; this.log=log;
+    SearchIconGuard(ClassLoader loader, PathRules rules, CompatibilityState compatibility, Consumer<String> log) throws ReflectiveOperationException {
+        this.rules=rules; this.compatibility=compatibility; this.log=log;
         ownerType=Class.forName("com.miui.gallery.provider.cache.MediaManager",false,loader);
         shareType=Class.forName("com.miui.gallery.provider.cache.ShareMediaManager",false,loader);
         listenerType=Class.forName("com.miui.gallery.provider.cache.CacheManager$OnOperationListener",false,loader);
@@ -59,7 +62,8 @@ final class SearchIconGuard {
                 if (name.equals("onInsert")) remember(args[0],false);
                 else if (Arrays.asList("onBulkInsert","onUpdate","onRemove").contains(name))
                     for(Object item:(List<?>)args[0]) remember(item,name.equals("onRemove"));
-            } catch (RuntimeException error) { report("event=icon_identity_error reason=UPDATE_FAILED"); }
+                compatibility.recovered("ICON_UPDATE");
+            } catch (RuntimeException | LinkageError error) { compatibility.failed("ICON_UPDATE",Feature.SUGGESTIONS); report("event=icon_identity_error reason=UPDATE_FAILED"); }
             return null;
         });
         for (Class<?> type:Arrays.asList(ownerType,shareType)) {
@@ -72,15 +76,16 @@ final class SearchIconGuard {
                 try {
                     Uri download=(Uri)XposedHelpers.getObjectField(p.args[0],"downloadUri");
                     if (download==null || !"com.miui.gallery.cloud.provider".equals(download.getAuthority())) {
-                        report("event=icon_identity_error reason=MEDIA_ID_UNAVAILABLE"); return;
+                        compatibility.failed("ICON_DISPLAY",Feature.SUGGESTIONS); report("event=icon_identity_error reason=MEDIA_ID_UNAVAILABLE"); return;
                     }
                     long id=ContentUris.parseId(download);
                     if (download.getPathSegments().contains("share_image"))
                         id=((Number)XposedHelpers.callStaticMethod(shareType,"convertToMediaId",id)).longValue();
                     indexReadyCaches();
                     Object item=originals.get(id);
-                    if (item==null) {report("event=icon_identity_error reason=MEDIA_NOT_IN_CACHE");return;}
+                    if (item==null) {compatibility.failed("ICON_DISPLAY",Feature.SUGGESTIONS);report("event=icon_identity_error reason=MEDIA_NOT_IN_CACHE");return;}
                     String original=(String)XposedHelpers.callMethod(item,"getFilePath");
+                    compatibility.recovered("ICON_DISPLAY");
                     if (!rules.matchesOriginalPath(original)) return;
                     // Null follows the application's backup-icon policy. Clear an older bound image too.
                     WeakReference<?> ref=(WeakReference<?>)XposedHelpers.getObjectField(p.thisObject,"mViewRef");
@@ -92,8 +97,8 @@ final class SearchIconGuard {
                     }
                     p.args[0]=null;
                     report("event=search_icon_excluded identity=ORIGINAL_MEDIA cache_mutated=false");
-                } catch (PathRules.InvalidPath error) {report("event=icon_identity_error reason=PATH_UNRESOLVED");}
-                catch (RuntimeException error) {report("event=icon_identity_error reason=FILTER_ERROR");}
+                } catch (PathRules.InvalidPath error) {compatibility.failed("ICON_DISPLAY",Feature.SUGGESTIONS);report("event=icon_identity_error reason=PATH_UNRESOLVED");}
+                catch (RuntimeException | LinkageError error) {compatibility.failed("ICON_DISPLAY",Feature.SUGGESTIONS);report("event=icon_identity_error reason=FILTER_ERROR");}
             }
         });
     }

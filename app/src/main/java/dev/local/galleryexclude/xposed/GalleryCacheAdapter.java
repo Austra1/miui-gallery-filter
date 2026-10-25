@@ -5,6 +5,10 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.SparseArray;
+import dev.local.galleryexclude.compat.CapabilityInstaller;
+import dev.local.galleryexclude.compat.CompatibilityReport.Feature;
+import dev.local.galleryexclude.compat.CompatibilityState;
+import dev.local.galleryexclude.compat.TargetInterfaces;
 import dev.local.galleryexclude.filter.DisplayFilter;
 import dev.local.galleryexclude.filter.PreviewIndex;
 import dev.local.galleryexclude.filter.QueryScope;
@@ -30,11 +34,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Lock;
 import java.util.function.Consumer;
 
-/** Exact-version adapter. Only consumer-owned synchronous reads can reach the cache predicate. */
-public final class Gallery35710Adapter {
+/** Capability-checked cache adapter. Only consumer-owned reads reach the media predicate. */
+public final class GalleryCacheAdapter {
     private final ClassLoader loader;
     private final RuleConfiguration config;
     private final Consumer<String> log;
+    private final CompatibilityState compatibility;
+    private boolean coreInstalled;
+    private boolean cursorBoundaryInstalled;
     private final QueryScope scope = new QueryScope();
     private final ThreadLocal<Integer> startup = new ThreadLocal<>();
     private final Map<Object, String> liveOwners = Collections.synchronizedMap(new WeakHashMap<>());
@@ -56,26 +63,55 @@ public final class Gallery35710Adapter {
     private TrashDisplayGuard trash;
     private ExternalPreviewGuard external;
 
-    public Gallery35710Adapter(ClassLoader loader, RuleConfiguration config, Consumer<String> log) {
-        this.loader = loader; this.config = config; this.log = log;
+    public GalleryCacheAdapter(ClassLoader loader, RuleConfiguration config, CompatibilityState compatibility, Consumer<String> log) {
+        this.loader = loader; this.config = config; this.compatibility = compatibility; this.log = log;
     }
 
-    public void install() throws Throwable {
-        // Resolve every required member before installing any hook. No fuzzy overload matching.
-        preflight();
-        try {
+    public void install() {
+        CapabilityInstaller installer = new CapabilityInstaller(compatibility, log);
+        if (!installer.install(Feature.CORE, () -> {
+            preflightCore();
+            installCore();
+            coreInstalled = true;
+        }, () -> rollbackFrom(0))) return;
+        extension(installer, Feature.MAP, this::installMap, () -> { });
+        extension(installer, Feature.LEGACY_DETAIL, this::installLegacyDetails, () -> { });
+        extension(installer, Feature.PICKER, this::installPicker, () -> { });
+        extension(installer, Feature.SEARCH, this::installSearch, () -> { searchLoader = null; });
+        extension(installer, Feature.SUGGESTIONS, () -> {
+            icons = new SearchIconGuard(loader, config.rules, compatibility, log);
+            suggestions = new LocalSuggestionGuard(loader, config.rules, icons, compatibility, log, this::albumSuggestionCover);
+            if (enabled()) { icons.install(loader); suggestions.install(); }
+        }, () -> { if (suggestions != null) suggestions.close(); if (icons != null) icons.close(); });
+        extension(installer, Feature.TRASH, () -> {
+            trash = new TrashDisplayGuard(loader, config.rules, compatibility, log);
+            if (enabled()) trash.install();
+        }, () -> { if (trash != null) trash.close(); });
+        extension(installer, Feature.EXTERNAL_PREVIEW, () -> {
+            external = new ExternalPreviewGuard(loader, config.rules, compatibility, log);
+            if (enabled()) external.install();
+        }, () -> { if (external != null) external.close(); });
+        log.accept("event=filter_adapter_installed revision=" + config.revision + " filtering=" + enabled()
+                + " adapter=gallery_cache capabilities=" + compatibility.report().state
+                + " unavailable=" + compatibility.report().unavailable);
+    }
+
+    private void extension(CapabilityInstaller installer, Feature feature, CapabilityInstaller.Task task, CapabilityInstaller.Task close) {
+        int mark = installed.size();
+        installer.install(feature, task, () -> {
+            try { rollbackFrom(mark); } finally { close.run(); }
+        });
+        if (!compatibility.coreAvailable()) coreInstalled = false;
+    }
+
+    private void rollbackFrom(int mark) {
+        while (installed.size() > mark) installed.remove(installed.size() - 1).unhook();
+    }
+
+    private void installCore() throws Throwable {
             ownLiveData(homeViewModel, "HOME", "liveData");
             ownLiveData(detailViewModel, "DETAIL", "liveData");
-            // Map markers and the smart-album cover are separate consumer-owned queries.
-            // Filter before the native eight-cover limit, coordinate clustering and marker counts.
-            ownLiveData(mapViewModel, "MAP", "mAllMediasShowOnMap");
-            ownLiveData(mapViewModel, "MAP_COVERS", "mMapAlbumCovers");
-            ownLiveData(pickerViewModel, "PICKER_HOME", "liveData");
-            ownCursorLoader(legacyFactory,"LEGACY_DETAIL");
-            ownCursorLoader(pickerFactory,"PICKER_DETAIL");
-            ownCursorLoader(recentPickerFactory,"PICKER_RECENT");
             hook(compute, readBoundary(null));
-            hook(cursorCompute,readBoundary("CURSOR_LIST"));
             hook(filter, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     try { filterMedia(p); }
@@ -125,9 +161,11 @@ public final class Gallery35710Adapter {
                         Object source = snapshotView(homeSource, p.thisObject);
                         validateSnapshot(source);
                         p.args[0] = source;
+                        compatibility.recovered("HOME_SNAPSHOT");
                         report("event=snapshot_source kind=HOME unfiltered=true");
                     } catch (Throwable error) {
                         p.setResult(null); // Never let a failed adapter forward a filtered snapshot for persistence.
+                        compatibility.failed("HOME_SNAPSHOT", Feature.CORE);
                         report("event=snapshot_source_error reason=" + safeReason(error));
                     }
                 }
@@ -155,7 +193,6 @@ public final class Gallery35710Adapter {
                     if (enabled() && !scope.isSuspended()) p.args[0] = displayAlbums((List<?>) p.args[0]);
                 }
             });
-            hook(searchResult, readBoundary("SEARCH"));
             XposedBridge.hookAllConstructors(cloudLoader, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     if (p.args.length != 3 || !(p.args[2] instanceof Bundle)) return;
@@ -164,25 +201,84 @@ public final class Gallery35710Adapter {
                 }
             }).forEach(installed::add);
             hook(previewQuery, readBoundary("PREVIEW"));
-            XC_MethodHook wrap = new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) throws Throwable { preparePreview(p); }
-                @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable { finishPreview(p); }
-            };
-            hook(cloudWrap, wrap); hook(searchWrap, wrap);
-            if (enabled()) { icons.install(loader); suggestions.install(); trash.install(); external.install(); }
-        } catch (Throwable error) {
-            for (XC_MethodHook.Unhook hook : installed) hook.unhook();
-            if (icons != null) icons.close();
-            if (suggestions != null) suggestions.close();
-            if (trash != null) trash.close();
-            if (external != null) external.close();
-            installed.clear(); throw error;
-        }
-        log.accept("event=filter_adapter_installed revision=" + config.revision + " filtering=" + enabled()
-                + " adapter=gallery_3_5_7_10 installed_hooks=home_detail_album_map_search_preview_icons_trash_picker_external");
+            hook(cloudWrap, previewWrapper());
     }
 
-    private boolean enabled() { return !config.rules.saved().isEmpty(); }
+    private XC_MethodHook previewWrapper() {
+        return new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                try { preparePreview(p); }
+                catch (RuntimeException | LinkageError error) {
+                    compatibility.failed("PREVIEW_INDEX", previewFeature(p.thisObject));
+                    report("event=preview_reindex_error reason=" + safeReason(error));
+                }
+            }
+            @Override protected void afterHookedMethod(MethodHookParam p) {
+                try { finishPreview(p); }
+                catch (RuntimeException | LinkageError error) {
+                    Object ranked = p.getObjectExtra("ranked_source");
+                    if (ranked != null) XposedHelpers.setObjectField(p.thisObject, "mIds", ranked);
+                    compatibility.failed("PREVIEW_INDEX", previewFeature(p.thisObject));
+                    report("event=preview_reindex_error reason=" + safeReason(error));
+                }
+            }
+        };
+    }
+
+    private Feature previewFeature(Object owner) {
+        return searchLoader != null && searchLoader.isInstance(owner) ? Feature.SEARCH : Feature.CORE;
+    }
+    private boolean enabled() { return coreInstalled && !config.rules.saved().isEmpty(); }
+
+    private void installMap() throws ReflectiveOperationException {
+        mapViewModel = type("com.miui.gallery.ui.MapViewModel");
+        for (String field : Arrays.asList("mAllMediasShowOnMap", "mMapAlbumCovers"))
+            if (mapViewModel.getDeclaredField(field).getType() != liveData)
+                throw new NoSuchFieldException("MapViewModel." + field);
+        ownLiveData(mapViewModel, "MAP", "mAllMediasShowOnMap");
+        ownLiveData(mapViewModel, "MAP_COVERS", "mMapAlbumCovers");
+    }
+
+    private void installLegacyDetails() throws ReflectiveOperationException {
+        legacyFactory = method(type("com.miui.gallery.ui.PhotoListFragmentBase$PhotoListLoaderCallback"),
+                "onCreateLoader", type("androidx.loader.content.Loader"), int.class, Bundle.class);
+        cursorCompute = method(type("androidx.loader.content.CursorLoader"), "loadInBackground", Cursor.class);
+        ownCursorLoader(legacyFactory, "LEGACY_DETAIL");
+        cursorBoundary(cursorCompute);
+    }
+
+    private void installPicker() throws ReflectiveOperationException {
+        pickerViewModel = type("com.miui.gallery.picker.PickHomePageViewMode");
+        if (pickerViewModel.getDeclaredField("liveData").getType() != liveData)
+            throw new NoSuchFieldException("PickHomePageViewMode.liveData");
+        Class<?> nativeLoader = type("androidx.loader.content.Loader");
+        pickerFactory = method(type("com.miui.gallery.picker.PickAlbumDetailFragment$AlbumDetailLoaderCallback"), "onCreateLoader", nativeLoader, int.class, Bundle.class);
+        recentPickerFactory = method(type("com.miui.gallery.picker.PickRecentDiscoveryFragment$RecentDiscoveryLoaderCallback"), "onCreateLoader", nativeLoader, int.class, Bundle.class);
+        Method cursor = method(type("androidx.loader.content.CursorLoader"), "loadInBackground", Cursor.class);
+        ownLiveData(pickerViewModel, "PICKER_HOME", "liveData");
+        ownCursorLoader(pickerFactory, "PICKER_DETAIL");
+        ownCursorLoader(recentPickerFactory, "PICKER_RECENT");
+        // Own the picker boundary independently when the legacy-detail API is absent.
+        cursorBoundary(cursor);
+    }
+
+    private void cursorBoundary(Method cursor) {
+        if (!cursorBoundaryInstalled) {
+            hook(cursor, readBoundary("CURSOR_LIST"));
+            cursorBoundaryInstalled = true;
+        }
+    }
+
+    private void installSearch() throws ReflectiveOperationException {
+        Class<?> search = type("com.miui.gallery.loader.SearchResultSetLoader");
+        searchResult = method(type("com.miui.gallery.search.resultpage.SearchImageResultHelper$ImageResultProcessor"), "createSuggestionResult", type("com.miui.gallery.search.core.result.SuggestionResult"), List.class, type("com.miui.gallery.search.core.QueryInfo"), type("com.miui.gallery.search.core.suggestion.RankInfo"), type("com.miui.gallery.search.core.result.ErrorInfo"));
+        searchWrap = method(search, "wrapDataSet", type("com.miui.gallery.model.CursorDataSet"), Cursor.class);
+        TargetInterfaces.field(search, "mIds", String[].class);
+        TargetInterfaces.field(search, "mInitPos", int.class);
+        searchLoader = search;
+        hook(searchResult, readBoundary("SEARCH"));
+        hook(searchWrap, previewWrapper());
+    }
 
     private void ownLiveData(Class<?> owner, String name, String field) {
         installed.addAll(XposedBridge.hookAllConstructors(owner, new XC_MethodHook() {
@@ -205,6 +301,7 @@ public final class Gallery35710Adapter {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
                 if (!enabled() || scope.isSuspended() || scope.active() != null) return;
                 String consumer = fixed;
+                try {
                 if("CURSOR_LIST".equals(consumer)){
                     consumer=cursorOwners.get(p.thisObject);
                     if(consumer==null || !localMedia((Uri)XposedHelpers.callMethod(p.thisObject,"getUri")))return;
@@ -226,6 +323,14 @@ public final class Gallery35710Adapter {
                     }
                 }
                 p.setObjectExtra("display_frame", scope.enter(consumer));
+                compatibility.recovered("BOUNDARY_" + consumer);
+                } catch (RuntimeException | LinkageError error) {
+                    Object uri = p.getObjectExtra("original_uri");
+                    if (uri != null) XposedHelpers.setObjectField(p.thisObject, "uri", uri);
+                    String failedConsumer = consumer == null ? "CORE" : consumer;
+                    compatibility.failed("BOUNDARY_" + failedConsumer, consumerFeature(failedConsumer));
+                    report("event=display_boundary_error consumer=" + failedConsumer + " reason=" + safeReason(error));
+                }
             }
             @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
                 QueryScope.Frame frame = (QueryScope.Frame) p.getObjectExtra("display_frame");
@@ -247,6 +352,7 @@ public final class Gallery35710Adapter {
                         }
                     } catch (Throwable error) {
                         if (home) homeSource = null;
+                        if (home) compatibility.failed("HOME_SNAPSHOT", Feature.CORE);
                         report("event=filter_recovery_error consumer=" + frame.consumer + " reason=" + safeReason(error));
                         if (frame.failure != null) {
                             Throwable cause = error instanceof java.lang.reflect.InvocationTargetException
@@ -255,6 +361,8 @@ public final class Gallery35710Adapter {
                         }
                     } finally { scope.resume(); }
                 }
+                if (frame.failure == null) compatibility.recovered(frame.consumer);
+                else compatibility.failed(frame.consumer, consumerFeature(frame.consumer));
                 report("event=display_query consumer=" + frame.consumer + " revision=" + config.revision
                         + " input=" + frame.inputCount + " excluded=" + frame.excludedCount
                         + " excluded_images=" + frame.excludedImages + " excluded_videos=" + frame.excludedVideos
@@ -265,6 +373,14 @@ public final class Gallery35710Adapter {
                 }
             }
         };
+    }
+
+    private static Feature consumerFeature(String consumer) {
+        if (consumer.startsWith("MAP")) return Feature.MAP;
+        if (consumer.startsWith("PICKER")) return Feature.PICKER;
+        if (consumer.equals("LEGACY_DETAIL")) return Feature.LEGACY_DETAIL;
+        if (consumer.equals("SEARCH")) return Feature.SEARCH;
+        return Feature.CORE;
     }
 
     private void filterMedia(XC_MethodHook.MethodHookParam p) throws Throwable {
@@ -357,9 +473,11 @@ public final class Gallery35710Adapter {
                 XposedHelpers.callMethod(display, "setCover", cover);
                 result.add(display);
             }
+            compatibility.recovered("ALBUM_DISPLAY");
             report("event=album_display revision=" + config.revision + " albums=" + result.size() + " source_mutated=false");
             return result;
         } catch (Throwable error) {
+            compatibility.failed("ALBUM_DISPLAY", Feature.CORE);
             report("event=album_display_error reason=" + safeReason(error));
             return source;
         } finally { scope.exit(frame); }
@@ -392,7 +510,7 @@ public final class Gallery35710Adapter {
     private void preparePreview(XC_MethodHook.MethodHookParam p) {
         if (!enabled() || !(p.args[0] instanceof Cursor)) return;
         Long key = previewKeys.get(p.thisObject);
-        if (searchLoader.isInstance(p.thisObject)) {
+        if (searchLoader != null && searchLoader.isInstance(p.thisObject)) {
             String[] ids = (String[]) XposedHelpers.getObjectField(p.thisObject, "mIds");
             if (ids == null) return;
             p.setObjectExtra("ranked_source", ids);
@@ -410,15 +528,19 @@ public final class Gallery35710Adapter {
         if (ranked != null) XposedHelpers.setObjectField(p.thisObject, "mIds", ranked);
         if (p.hasThrowable() || p.getResult() == null) return;
         Long key = (Long) p.getObjectExtra("selected_id");
-        if (key == null) { report("event=preview_reindex_error reason=SELECTED_ID_MISSING"); return; }
+        if (key == null) {
+            compatibility.failed("PREVIEW_INDEX", previewFeature(p.thisObject));
+            report("event=preview_reindex_error reason=SELECTED_ID_MISSING"); return;
+        }
         Object dataSet = p.getResult();
         List<Long> ids;
-        if (searchLoader.isInstance(p.thisObject)) {
+        if (searchLoader != null && searchLoader.isInstance(p.thisObject)) {
             List<?> rankedIds = (List<?>) XposedHelpers.getObjectField(dataSet, "mIds");
             ids = new ArrayList<>(); for (Object id : rankedIds) ids.add(Long.valueOf(id.toString()));
         } else ids = cursorIds((Cursor) XposedHelpers.getObjectField(dataSet, "mCursor"));
         int fallback = ((Number) XposedHelpers.callMethod(dataSet, "getInitPosition")).intValue();
         XposedHelpers.callMethod(dataSet, "setInitPosition", PreviewIndex.locate(ids, key, fallback));
+        compatibility.recovered("PREVIEW_INDEX");
         report("event=preview_reindexed revision=" + config.revision + " count=" + ids.size());
     }
 
@@ -445,19 +567,10 @@ public final class Gallery35710Adapter {
     private Class<?> type(String name) throws ClassNotFoundException { return Class.forName(name, false, loader); }
     private Class<?> typeUnchecked(String name) { try { return type(name); } catch (ClassNotFoundException e) { throw new IllegalStateException(e); } }
     private static Method method(Class<?> owner, String name, Class<?> returns, Class<?>... parameters) throws NoSuchMethodException {
-        for (Method member : owner.getDeclaredMethods()) {
-            if (member.getName().equals(name) && member.getReturnType().equals(returns) && Arrays.equals(member.getParameterTypes(), parameters)) {
-                member.setAccessible(true); return member;
-            }
-        }
-        throw new NoSuchMethodException(owner.getName() + "." + name);
+        return TargetInterfaces.hookMethod(owner, name, returns, parameters);
     }
 
-    private void preflight() throws ReflectiveOperationException {
-        icons = new SearchIconGuard(loader, config.rules, log);
-        suggestions = new LocalSuggestionGuard(loader, config.rules, icons, log, this::albumSuggestionCover);
-        trash = new TrashDisplayGuard(loader, config.rules, log);
-        external = new ExternalPreviewGuard(loader, config.rules, log);
+    private void preflightCore() throws ReflectiveOperationException {
         mediaManager = type("com.miui.gallery.provider.cache.MediaManager");
         shareManager = type("com.miui.gallery.provider.cache.ShareMediaManager");
         mediaItem = type("com.miui.gallery.provider.cache.MediaCacheItem");
@@ -469,16 +582,9 @@ public final class Gallery35710Adapter {
         liveData = type("com.miui.gallery.provider.cache.CacheLiveData");
         homeViewModel = type("com.miui.gallery.ui.HomePageViewModel");
         detailViewModel = type("com.miui.gallery.ui.PhotoListViewModel");
-        mapViewModel = type("com.miui.gallery.ui.MapViewModel");
-        pickerViewModel = type("com.miui.gallery.picker.PickHomePageViewMode");
-        Class<?> nativeLoader=type("androidx.loader.content.Loader");
-        legacyFactory=method(type("com.miui.gallery.ui.PhotoListFragmentBase$PhotoListLoaderCallback"),"onCreateLoader",nativeLoader,int.class,Bundle.class);
-        pickerFactory=method(type("com.miui.gallery.picker.PickAlbumDetailFragment$AlbumDetailLoaderCallback"),"onCreateLoader",nativeLoader,int.class,Bundle.class);
-        recentPickerFactory=method(type("com.miui.gallery.picker.PickRecentDiscoveryFragment$RecentDiscoveryLoaderCallback"),"onCreateLoader",nativeLoader,int.class,Bundle.class);
-        cursorCompute=method(type("androidx.loader.content.CursorLoader"),"loadInBackground",Cursor.class);
         startupHelper = type("com.miui.gallery.activity.HomePageStartupHelper2");
         clustered = type("com.miui.gallery.data.ClusteredList");
-        cloudLoader = type("com.miui.gallery.loader.CloudSetLoader"); searchLoader = type("com.miui.gallery.loader.SearchResultSetLoader");
+        cloudLoader = type("com.miui.gallery.loader.CloudSetLoader");
         compute = method(liveData, "compute", List.class);
         filter = method(cacheManager, "filter", List.class, type("com.miui.gallery.provider.cache.Filter"));
         mediaPath = method(mediaItem, "getFilePath", String.class); mediaSize = method(mediaItem, "getSize", long.class);
@@ -496,18 +602,46 @@ public final class Gallery35710Adapter {
                 type("com.miui.gallery.activity.HomePageStartupHelper2$Snapshot"));
         albumDisplay = method(type("com.miui.gallery.ui.album.main.utils.AlbumGroupByAlbumTypeFunction$1"), "apply", type("org.reactivestreams.Publisher"), List.class);
         albumSnapshot = method(type("com.miui.gallery.ui.album.main.usecase.QuerySnapAlbumList"), "buildUseCaseFlowable", type("io.reactivex.Flowable"), type("com.miui.gallery.ui.album.main.utils.AlbumGroupByAlbumTypeFunction$Config"));
-        searchResult = method(type("com.miui.gallery.search.resultpage.SearchImageResultHelper$ImageResultProcessor"), "createSuggestionResult", type("com.miui.gallery.search.core.result.SuggestionResult"), List.class, type("com.miui.gallery.search.core.QueryInfo"), type("com.miui.gallery.search.core.suggestion.RankInfo"), type("com.miui.gallery.search.core.result.ErrorInfo"));
         previewQuery = method(type("com.miui.gallery.loader.CursorSetLoader"), "query", Cursor.class, Uri.class, String[].class, String.class, String[].class, String.class, String.class);
         Class<?> dataSet = type("com.miui.gallery.model.CursorDataSet");
-        cloudWrap = method(cloudLoader, "wrapDataSet", dataSet, Cursor.class); searchWrap = method(searchLoader, "wrapDataSet", dataSet, Cursor.class);
+        cloudWrap = method(cloudLoader, "wrapDataSet", dataSet, Cursor.class);
         method(type("com.miui.gallery.util.GalleryMemoryCacheHelper"), "remove", Object.class, String.class);
         // Parcelable omits the routing ID and other business fields; verify a complete detached DTO copy instead.
         DetachedCopy.verify(album); coverBean.getConstructor(long.class, String.class, String.class, int.class, long.class, boolean.class);
         album.getMethod("setPhotoCount", int.class); album.getMethod("setAlbumSize", long.class); album.getMethod("setCover", coverBean);
         liveData.getDeclaredField("uri"); homeViewModel.getDeclaredField("liveData"); detailViewModel.getDeclaredField("liveData");
-        pickerViewModel.getDeclaredField("liveData");
-        for (String field : Arrays.asList("mAllMediasShowOnMap", "mMapAlbumCovers"))
-            if (mapViewModel.getDeclaredField(field).getType() != liveData)
-                throw new NoSuchFieldException("MapViewModel." + field);
+        TargetInterfaces.field(homeViewModel, "liveData", liveData);
+        TargetInterfaces.field(detailViewModel, "liveData", liveData);
+        TargetInterfaces.field(liveData, "uri", Uri.class);
+        TargetInterfaces.field(albumManager, "mReadLock", Lock.class);
+        TargetInterfaces.publicMethod(mediaManager, "getInstance", mediaManager);
+        TargetInterfaces.publicMethod(mediaManager, "isInitialized", boolean.class);
+        TargetInterfaces.publicMethod(albumManager, "getInstance", albumManager);
+        TargetInterfaces.publicMethod(albumItem, "getId", long.class);
+        TargetInterfaces.publicMethod(album, "getAlbumId", long.class);
+        TargetInterfaces.publicMethod(album, "getPhotoCount", int.class);
+        TargetInterfaces.publicMethod(album, "getCoverId", long.class);
+        for (String field : Arrays.asList("isVirtualAlbum", "mPhotoCount", "mCoverId", "mCoverPath", "mCoverSha1",
+                "mCoverSyncState", "mCoverSize", "isManualSetCover")) TargetInterfaces.field(albumItem, field, null);
+        TargetInterfaces.field(dataSet, "mCursor", Cursor.class);
+        TargetInterfaces.publicMethod(dataSet, "getInitPosition", int.class);
+        TargetInterfaces.publicMethod(dataSet, "setInitPosition", void.class, int.class);
+        TargetInterfaces.publicMethod(type("com.miui.gallery.model.ImageLoadParams"), "getKey", long.class);
+        Class<?> viewMode = type("com.miui.gallery.ui.pictures.PictureViewMode");
+        TargetInterfaces.field(homeFragment, "mViewMode", viewMode);
+        TargetInterfaces.publicMethod(viewMode, "getClusterKey", int.class);
+        clustered.getDeclaredConstructor(List.class, SparseArray.class, SparseArray.class, boolean.class, int.class);
+        TargetInterfaces.field(clustered, "contents", List.class);
+        TargetInterfaces.field(clustered, "sections", SparseArray.class);
+        TargetInterfaces.field(clustered, "clusters", SparseArray.class);
+        Class<?> snapshot = type("com.miui.gallery.activity.HomePageStartupHelper2$Snapshot");
+        Class<?> companion = type("com.miui.gallery.activity.HomePageStartupHelper2$Snapshot$Companion");
+        Class<?> header = type("com.miui.gallery.model.HomeMediaHeader");
+        TargetInterfaces.field(snapshot, "Companion", companion);
+        TargetInterfaces.publicMethod(companion, "build", snapshot, List.class);
+        TargetInterfaces.publicMethod(snapshot, "getMedias", List.class);
+        TargetInterfaces.publicMethod(snapshot, "getHeader", header);
+        TargetInterfaces.publicMethod(header, "getGroupItemCount", List.class, header);
+        TargetInterfaces.publicMethod(header, "getGroupItemStartPos", List.class, header);
     }
 }

@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.ActivityNotFoundException;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ApplicationInfo;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
 import android.net.Uri;
@@ -30,6 +31,9 @@ import dev.local.galleryexclude.config.RuleRepository;
 import dev.local.galleryexclude.config.SharedConfig;
 import dev.local.galleryexclude.config.StorageDocuments;
 import dev.local.galleryexclude.config.GalleryRestarter;
+import dev.local.galleryexclude.config.GalleryStatusClient;
+import dev.local.galleryexclude.compat.CompatibilityReport;
+import dev.local.galleryexclude.compat.CompatibilityNotice;
 import dev.local.galleryexclude.rules.PathRules;
 import dev.local.galleryexclude.rules.RuleConfiguration;
 
@@ -46,6 +50,9 @@ public final class MainActivity extends Activity {
     private static final int PICK_DIRECTORY=300;
     private GalleryRestarter restarter;
     private Consumer<GalleryRestarter.Phase> restartListener;
+    private GalleryStatusClient statusClient;
+    private CompatibilityReport localCompatibility;
+    private boolean resumed;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -55,7 +62,8 @@ public final class MainActivity extends Activity {
         status = findViewById(R.id.config_status);
         list = findViewById(R.id.rule_list);
         save = findViewById(R.id.save_rules);
-        showCompatibilityNotice();
+        statusClient = new GalleryStatusClient(this);
+        inspectGalleryRuntime();
         openConfiguration();
         if (state != null && state.containsKey("draft")) {
             draft.clear();
@@ -77,7 +85,10 @@ public final class MainActivity extends Activity {
             updateManualToggle();
             hideKeyboard();
         });
-        findViewById(R.id.retry_config).setOnClickListener(view -> openConfiguration());
+        findViewById(R.id.retry_config).setOnClickListener(view -> {
+            openConfiguration();
+            if (resumed) refreshCompatibility();
+        });
         save.setOnClickListener(view -> saveDraft());
         Object retained=getLastNonConfigurationInstance();
         restarter=retained instanceof GalleryRestarter?(GalleryRestarter)retained:new GalleryRestarter(this);
@@ -85,6 +96,8 @@ public final class MainActivity extends Activity {
             if(isDestroyed())return;
             if(phase!=GalleryRestarter.Phase.IDLE)Log.i(ModuleInfo.LOG_TAG,"event=gallery_restart phase="+phase+" reason="+restarter.failure()+" diagnostic="+restarter.diagnostic());
             render();
+            if (resumed && (phase == GalleryRestarter.Phase.SUCCEEDED || phase == GalleryRestarter.Phase.FAILED))
+                refreshCompatibility();
         });
         restarter.listen(restartListener);
     }
@@ -145,6 +158,7 @@ public final class MainActivity extends Activity {
     }
 
     private void chooseDirectory(){
+        if (repository == null || busy()) return;
         Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         String initial=!draft.isEmpty()?draft.get(0):repository.current().rules.saved().isEmpty()?null:repository.current().rules.saved().get(0);
         Uri tree=StorageDocuments.initialDirectory(this,initial);
@@ -296,6 +310,17 @@ public final class MainActivity extends Activity {
         super.onDestroy();
     }
 
+    @Override protected void onResume() {
+        super.onResume(); resumed = true;
+        refreshCompatibility();
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        statusClient.cancel();
+        super.onPause();
+    }
+
     @Override public void onBackPressed() {
         if (dirty() || input.length() != 0) {
             new AlertDialog.Builder(this).setTitle(R.string.discard_title).setMessage(R.string.discard_body)
@@ -309,19 +334,31 @@ public final class MainActivity extends Activity {
         input.clearFocus();
     }
 
-    private void showCompatibilityNotice() {
-        TextView notice=findViewById(R.id.compatibility_notice);
+    private void inspectGalleryRuntime() {
         try {
             PackageInfo info = getPackageManager().getPackageInfo(ModuleInfo.TARGET_PACKAGE, 0);
-            boolean supported = info.getLongVersionCode() == ModuleInfo.BASELINE_VERSION_CODE
-                    && ModuleInfo.BASELINE_VERSION_NAME.equals(info.versionName);
-            if(!supported){
-                notice.setText(getString(R.string.gallery_unsupported,info.versionName));
-                notice.setVisibility(View.VISIBLE);
-            }
+            ApplicationInfo app = info.applicationInfo;
+            boolean nativePackage = (app.flags & ApplicationInfo.FLAG_HAS_CODE) == 0;
+            localCompatibility = nativePackage ? CompatibilityReport.of(CompatibilityReport.State.NATIVE_UNSUPPORTED) : null;
         } catch (PackageManager.NameNotFoundException error) {
-            notice.setText(R.string.gallery_not_found);notice.setVisibility(View.VISIBLE);
+            localCompatibility = CompatibilityReport.of(CompatibilityReport.State.GALLERY_MISSING);
         }
+    }
+
+    private void refreshCompatibility() {
+        inspectGalleryRuntime();
+        if (localCompatibility != null && localCompatibility.state == CompatibilityReport.State.GALLERY_MISSING) {
+            showCompatibility(localCompatibility); return;
+        }
+        // A live Java adapter receipt takes precedence over package flags (including split APKs).
+        statusClient.refresh(repository == null ? -1 : repository.current().revision, report ->
+                showCompatibility(report.state == CompatibilityReport.State.WAITING && localCompatibility != null
+                        ? localCompatibility : report));
+    }
+
+    private void showCompatibility(CompatibilityReport report) {
+        CompatibilityNotice.bind(findViewById(R.id.compatibility_notice), report);
+        Log.i(ModuleInfo.LOG_TAG, "event=compatibility_ui state=" + report.state + " unavailable=" + report.unavailable);
     }
 
     private static String reason(RuntimeException error) {

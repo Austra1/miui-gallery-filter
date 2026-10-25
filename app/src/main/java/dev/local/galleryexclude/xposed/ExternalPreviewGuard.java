@@ -14,6 +14,8 @@ import dev.local.galleryexclude.config.StorageDocuments;
 import dev.local.galleryexclude.filter.DisplayFilter;
 import dev.local.galleryexclude.filter.VisibleCursor;
 import dev.local.galleryexclude.rules.PathRules;
+import dev.local.galleryexclude.compat.CompatibilityState;
+import dev.local.galleryexclude.compat.CompatibilityReport.Feature;
 import java.io.File;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -28,14 +30,15 @@ import java.util.function.Consumer;
 final class ExternalPreviewGuard {
     private final PathRules rules;
     private final Consumer<String> log;
+    private final CompatibilityState compatibility;
     private final Class<?> activityType,mediaLoader,contentUtils;
     private final Method create,permissions,newIntent,query;
     private final Constructor<?> storageData;
     private final List<XC_MethodHook.Unhook> hooks=new ArrayList<>();
     private final Set<String> reported=ConcurrentHashMap.newKeySet();
 
-    ExternalPreviewGuard(ClassLoader loader,PathRules rules,Consumer<String> log)throws ReflectiveOperationException{
-        this.rules=rules;this.log=log;
+    ExternalPreviewGuard(ClassLoader loader,PathRules rules,CompatibilityState compatibility,Consumer<String> log)throws ReflectiveOperationException{
+        this.rules=rules;this.compatibility=compatibility;this.log=log;
         activityType=Class.forName("com.miui.gallery.activity.BaseExternalPhotoPageActivity",false,loader);
         mediaLoader=Class.forName("com.miui.gallery.loader.MediaSetLoader",false,loader);
         contentUtils=Class.forName("com.miui.gallery.util.ContentUtils",false,loader);
@@ -94,8 +97,9 @@ final class ExternalPreviewGuard {
                         return new PathRules.Resolution(PathRules.Kind.ORIGINAL_PATH,source.getString(pathColumn));
                     });
                     if(result.status==DisplayFilter.Status.FILTERED)p.setResult(new VisibleCursor(source,result.items));
+                    status("EXTERNAL_CURSOR",result.status);
                     report("event=external_media_query input="+source.getCount()+" excluded="+(source.getCount()-result.items.size())+" status="+result.status);
-                }catch(RuntimeException error){report("event=external_preview_error consumer=MEDIA_CURSOR reason=PATH_UNAVAILABLE");}
+                }catch(RuntimeException | LinkageError error){compatibility.failed("EXTERNAL_CURSOR",Feature.EXTERNAL_PREVIEW);report("event=external_preview_error consumer=MEDIA_CURSOR reason=PATH_UNAVAILABLE");}
                 finally{source.moveToPosition(before);}
             }
         });
@@ -106,6 +110,7 @@ final class ExternalPreviewGuard {
                 DisplayFilter.Result<File> result=DisplayFilter.select(source,rules,file->new PathRules.Resolution(
                         PathRules.Kind.ORIGINAL_PATH,file.getAbsolutePath()));
                 if(result.status==DisplayFilter.Status.FILTERED)p.args[1]=result.items;
+                status("EXTERNAL_STORAGE",result.status);
                 report("event=external_storage_query input="+source.size()+" excluded="+(source.size()-result.items.size())+" status="+result.status);
             }
         });
@@ -116,14 +121,19 @@ final class ExternalPreviewGuard {
         try{
             String path=originalPath(context,uri);
             if(path==null){
-                if("content".equals(uri.getScheme()))report("event=external_preview_error consumer=ENTRY reason=ORIGINAL_PATH_UNAVAILABLE");
+                if("content".equals(uri.getScheme())){compatibility.failed("EXTERNAL_ENTRY",Feature.EXTERNAL_PREVIEW);report("event=external_preview_error consumer=ENTRY reason=ORIGINAL_PATH_UNAVAILABLE");}
                 return false;
             }
             boolean excluded=rules.matchesOriginalPath(path);
+            compatibility.recovered("EXTERNAL_ENTRY");
             report("event=external_preview_entry scheme="+("file".equals(uri.getScheme())?"FILE":"CONTENT")
                     +" status="+(excluded?"EXCLUDED_BEFORE_PRELOAD":"VISIBLE"));
             return excluded;
-        }catch(RuntimeException error){report("event=external_preview_error consumer=ENTRY reason=PATH_UNAVAILABLE");return false;}
+        }catch(RuntimeException | LinkageError error){compatibility.failed("EXTERNAL_ENTRY",Feature.EXTERNAL_PREVIEW);report("event=external_preview_error consumer=ENTRY reason=PATH_UNAVAILABLE");return false;}
+    }
+    private void status(String consumer,DisplayFilter.Status status){
+        if(status==DisplayFilter.Status.FILTERED || status==DisplayFilter.Status.BYPASS)compatibility.recovered(consumer);
+        else compatibility.failed(consumer,Feature.EXTERNAL_PREVIEW);
     }
     private String originalPath(Context context,Uri uri){
         if("file".equals(uri.getScheme()))return uri.getPath();

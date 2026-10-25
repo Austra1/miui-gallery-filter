@@ -14,6 +14,8 @@ import dev.local.galleryexclude.filter.PreviewIndex;
 import dev.local.galleryexclude.filter.TrashPath;
 import dev.local.galleryexclude.filter.VisibleCursor;
 import dev.local.galleryexclude.rules.PathRules;
+import dev.local.galleryexclude.compat.CompatibilityState;
+import dev.local.galleryexclude.compat.CompatibilityReport.Feature;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +31,7 @@ import java.util.function.Consumer;
 final class TrashDisplayGuard {
     private final PathRules rules;
     private final Consumer<String> log;
+    private final CompatibilityState compatibility;
     private final Class<?> trashLoader;
     private final String primaryStorage;
     private final Method sort,size,query,wrap,countFactory,countLoad;
@@ -38,8 +41,8 @@ final class TrashDisplayGuard {
     private final List<XC_MethodHook.Unhook> hooks=new ArrayList<>();
     private static final Uri URI=Uri.parse("content://com.miui.gallery.cloud.provider/trash_bin");
 
-    TrashDisplayGuard(ClassLoader loader,PathRules rules,Consumer<String> log)throws ReflectiveOperationException{
-        this.rules=rules;this.log=log;
+    TrashDisplayGuard(ClassLoader loader,PathRules rules,CompatibilityState compatibility,Consumer<String> log)throws ReflectiveOperationException{
+        this.rules=rules;this.compatibility=compatibility;this.log=log;
         Class<?> viewModel=Class.forName("com.miui.gallery.viewmodel.TrashViewModel",false,loader);
         trashLoader=Class.forName("com.miui.gallery.loader.TrashPhotoSetLoader",false,loader);
         Class<?> storage=Class.forName("com.miui.gallery.util.StorageUtils",false,loader);
@@ -65,6 +68,7 @@ final class TrashDisplayGuard {
                         (String)XposedHelpers.callMethod(item,"getAlbumPath"),(String)XposedHelpers.callMethod(item,"getFileName")));
                 int input=display.size(),excluded=input-result.items.size();
                 if(result.status==DisplayFilter.Status.FILTERED){display.clear();display.addAll(result.items);}
+                status("TRASH_LIST",result.status);
                 report("event=trash_display input="+input+" excluded="+excluded+" status="+result.status+" source_cache_mutated=false");
             }
         });
@@ -73,8 +77,8 @@ final class TrashDisplayGuard {
                 try{
                     ContentResolver resolver=(ContentResolver)XposedHelpers.getObjectField(p.thisObject,"mContentResolver");
                     String selection=(String)XposedHelpers.callMethod(p.thisObject,"buildSelection",(Object)null);
-                    long[] stats=stats(resolver,selection,null);p.setResult(stats[1]);
-                }catch(RuntimeException error){report("event=trash_display_error consumer=SIZE reason=ORIGINAL_LOCATION_UNAVAILABLE");}
+                    long[] stats=stats(resolver,selection,null);p.setResult(stats[1]);compatibility.recovered("TRASH_SIZE");
+                }catch(RuntimeException | LinkageError error){compatibility.failed("TRASH_SIZE",Feature.TRASH);report("event=trash_display_error consumer=SIZE reason=ORIGINAL_LOCATION_UNAVAILABLE");}
             }
         });
         hooks.addAll(XposedBridge.hookAllConstructors(trashLoader,new XC_MethodHook(){
@@ -93,8 +97,9 @@ final class TrashDisplayGuard {
                         selected.put(p.thisObject,source.getLong(source.getColumnIndexOrThrow("_id")));
                     DisplayFilter.Result<Integer> result=select(source);
                     if(result.status==DisplayFilter.Status.FILTERED)p.setResult(new VisibleCursor(source,result.items));
+                    status("TRASH_PREVIEW",result.status);
                     report("event=trash_preview input="+source.getCount()+" excluded="+(source.getCount()-result.items.size())+" status="+result.status);
-                }catch(RuntimeException error){report("event=trash_display_error consumer=PREVIEW reason=ORIGINAL_LOCATION_UNAVAILABLE");}
+                }catch(RuntimeException | LinkageError error){compatibility.failed("TRASH_PREVIEW",Feature.TRASH);report("event=trash_display_error consumer=PREVIEW reason=ORIGINAL_LOCATION_UNAVAILABLE");}
                 finally{source.moveToPosition(before);}
             }
         });
@@ -120,13 +125,18 @@ final class TrashDisplayGuard {
                             (String)XposedHelpers.getObjectField(p.thisObject,"mSelection"),
                             (String[])XposedHelpers.getObjectField(p.thisObject,"mSelectionArgs"));
                     p.setResult(new CountCursor((Cursor)p.getResult(),stats[0]));
+                    compatibility.recovered("TRASH_COUNT");
                     report("event=trash_count visible="+stats[0]+" status=FILTERED");
-                }catch(RuntimeException error){report("event=trash_display_error consumer=COUNT reason=ORIGINAL_LOCATION_UNAVAILABLE");}
+                }catch(RuntimeException | LinkageError error){compatibility.failed("TRASH_COUNT",Feature.TRASH);report("event=trash_display_error consumer=COUNT reason=ORIGINAL_LOCATION_UNAVAILABLE");}
             }
         });
     }
     private PathRules.Resolution resolution(String album,String file){
         return new PathRules.Resolution(PathRules.Kind.ORIGINAL_PATH,TrashPath.original(album,file,primaryStorage));
+    }
+    private void status(String consumer,DisplayFilter.Status status){
+        if(status==DisplayFilter.Status.FILTERED || status==DisplayFilter.Status.BYPASS)compatibility.recovered(consumer);
+        else compatibility.failed(consumer,Feature.TRASH);
     }
     private DisplayFilter.Result<Integer> select(Cursor source){
         int album=source.getColumnIndexOrThrow("albumPath"),file=source.getColumnIndexOrThrow("fileName");

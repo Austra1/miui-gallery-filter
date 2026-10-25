@@ -6,6 +6,8 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import dev.local.galleryexclude.filter.DisplayFilter;
 import dev.local.galleryexclude.rules.PathRules;
+import dev.local.galleryexclude.compat.CompatibilityState;
+import dev.local.galleryexclude.compat.CompatibilityReport.Feature;
 import java.io.File;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -25,6 +27,7 @@ final class LocalSuggestionGuard {
     private final PathRules rules;
     private final SearchIconGuard identities;
     private final Consumer<String> log;
+    private final CompatibilityState compatibility;
     private final Function<Uri,long[]> albumCover;
     private final java.util.Set<String> reported=ConcurrentHashMap.newKeySet();
     private final List<XC_MethodHook.Unhook> hooks=new ArrayList<>();
@@ -35,8 +38,9 @@ final class LocalSuggestionGuard {
     private final Method aiCacheSave;
     private final Class<?> flowable;
 
-    LocalSuggestionGuard(ClassLoader loader,PathRules rules,SearchIconGuard identities,Consumer<String> log,Function<Uri,long[]> albumCover) throws ReflectiveOperationException {
+    LocalSuggestionGuard(ClassLoader loader,PathRules rules,SearchIconGuard identities,CompatibilityState compatibility,Consumer<String> log,Function<Uri,long[]> albumCover) throws ReflectiveOperationException {
         this.rules=rules;this.identities=identities;this.log=log;
+        this.compatibility=compatibility;
         this.albumCover=albumCover;
         Class<?> location=Class.forName("com.miui.gallery.search.core.source.local.LocationSource",false,loader);
         Class<?> scene=Class.forName("com.miui.gallery.search.core.source.local.LocalSceneSource",false,loader);
@@ -93,8 +97,8 @@ final class LocalSuggestionGuard {
                         XposedHelpers.setObjectField(copy,"mSuggestionIcons",Collections.emptyList());
                         result.add(copy);
                     }
-                    p.args[1]=result;report("event=album_suggestions rebuilt="+result.size()+" source_mutated=false");
-                }catch(ReflectiveOperationException|RuntimeException error){report("event=album_suggestions_error reason=IDENTITY_OR_PATH_UNRESOLVED");}
+                    p.args[1]=result;compatibility.recovered("ALBUM_SUGGESTIONS");report("event=album_suggestions rebuilt="+result.size()+" source_mutated=false");
+                }catch(ReflectiveOperationException|RuntimeException|LinkageError error){compatibility.failed("ALBUM_SUGGESTIONS",Feature.SUGGESTIONS);report("event=album_suggestions_error reason=IDENTITY_OR_PATH_UNRESOLVED");}
             }
         }));
         hooks.add(XposedBridge.hookMethod(locationQuery,boundary("LOCATION")));
@@ -113,12 +117,12 @@ final class LocalSuggestionGuard {
                     List<String> strings=new ArrayList<>();for(Long id:visible)strings.add(id.toString());
                     XposedHelpers.setObjectField(copy,"mMediaIds",strings);
                     p.args[0]=copy;p.setObjectExtra("visible_members",visible);frame.rebuilt++;
-                }catch(RuntimeException error){frame.failure="FILTER_ERROR";}
+                }catch(RuntimeException | LinkageError error){frame.failure="FILTER_ERROR";}
             }
             @Override @SuppressWarnings("unchecked") protected void afterHookedMethod(MethodHookParam p) {
                 Frame frame=current.get();List<Long> ids=(List<Long>)p.getObjectExtra("visible_members");
                 if(frame==null || ids==null || p.hasThrowable() || p.getResult()==null)return;
-                try{p.setResult(copySuggestion(p.getResult(),ids));}catch(ReflectiveOperationException|RuntimeException error){frame.failure="FILTER_ERROR";}
+                try{p.setResult(copySuggestion(p.getResult(),ids));}catch(ReflectiveOperationException|RuntimeException|LinkageError error){frame.failure="FILTER_ERROR";}
             }
         }));
         hooks.add(XposedBridge.hookMethod(sceneCreate,new XC_MethodHook(){
@@ -132,7 +136,7 @@ final class LocalSuggestionGuard {
                     if(visible.isEmpty()){p.setResult(null);frame.removed++;return;}
                     // The scene cache keeps its original suggestion; only this display result is copied.
                     p.setResult(copySuggestion(p.getResult(),visible));frame.rebuilt++;
-                }catch(ReflectiveOperationException|RuntimeException error){frame.failure="FILTER_ERROR";}
+                }catch(ReflectiveOperationException|RuntimeException|LinkageError error){frame.failure="FILTER_ERROR";}
             }
         }));
     }
@@ -144,15 +148,19 @@ final class LocalSuggestionGuard {
                     // Search QueryTask workers may run before the media cache has loaded.
                     // Wait at the producer boundary, never while resolving individual members.
                     if(!identities.awaitOriginals()){
+                        compatibility.failed("SUGGESTIONS_"+kind,Feature.SUGGESTIONS);
                         report("event=local_suggestions kind="+kind+" status=CACHE_NOT_READY");return;
                     }
-                }catch(RuntimeException error){report("event=local_suggestions kind="+kind+" status=CACHE_WAIT_FAILED");return;}
+                }catch(RuntimeException | LinkageError error){compatibility.failed("SUGGESTIONS_"+kind,Feature.SUGGESTIONS);report("event=local_suggestions kind="+kind+" status=CACHE_WAIT_FAILED");return;}
                 Frame frame=new Frame();frame.kind=kind;current.set(frame);p.setObjectExtra("suggestion_frame",frame);
             }
             @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
                 Frame frame=(Frame)p.getObjectExtra("suggestion_frame");if(frame==null)return;current.remove();
                 if(p.hasThrowable())return;
-                if(frame.failure!=null)p.setResult(XposedBridge.invokeOriginalMethod((Method)p.method,p.thisObject,p.args));
+                if(frame.failure!=null){
+                    compatibility.failed("SUGGESTIONS_"+kind,Feature.SUGGESTIONS);
+                    p.setResult(XposedBridge.invokeOriginalMethod((Method)p.method,p.thisObject,p.args));
+                }else compatibility.recovered("SUGGESTIONS_"+kind);
                 String message="event=local_suggestions kind="+kind+" removed="+frame.removed+" rebuilt="+frame.rebuilt
                         +" status="+(frame.failure==null?"FILTERED":frame.failure)+" source_mutated=false cover_kind=FILE_VISIBLE";
                 report(message);
